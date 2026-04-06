@@ -13,7 +13,7 @@ from telegram.ext import (
 TOKEN = os.getenv("BOT_TOKEN")
 
 # 👉 这里填你的TG用户ID
-ADMIN_ID = @vyfjii
+ADMIN_ID = 5593962796
 
 # 默认设置
 chat_settings = {}
