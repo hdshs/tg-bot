@@ -1,6 +1,8 @@
 import os
 import json
 import asyncio
+import psycopg2
+import psycopg2.extras
 from pathlib import Path
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,10 +16,11 @@ from telegram.ext import (
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 # ===== 这里改成你自己的信息 =====
 ADMIN_ID = 5593962796
-ADMIN_USERNAME = "@vyfjii"
+ADMIN_USERNAME = "vyfjii"
 # ===========================
 
 DATA_DIR = Path("data")
@@ -26,7 +29,6 @@ DATA_DIR.mkdir(exist_ok=True)
 WHITELIST_FILE = DATA_DIR / "whitelist_users.json"
 GROUPS_FILE = DATA_DIR / "groups.json"
 PENDING_FILE = DATA_DIR / "pending_actions.json"
-ADS_FILE = DATA_DIR / "group_ads.json"
 
 DEFAULT_DELETE_DELAY = 6
 DEFAULT_GROUP_LIMIT = 1
@@ -34,6 +36,12 @@ DEFAULT_EXPIRE_DAYS = 30
 
 DEFAULT_AD_INTERVAL_MINUTES = 60
 DEFAULT_AD_MAX_COUNT = 3
+
+if not TOKEN:
+    raise RuntimeError("未检测到 BOT_TOKEN")
+
+if not DATABASE_URL:
+    raise RuntimeError("未检测到 DATABASE_URL")
 
 
 # =========================
@@ -75,14 +83,138 @@ def save_json(path: Path, data):
 whitelist_users = load_json(WHITELIST_FILE, {})
 groups_data = load_json(GROUPS_FILE, {})
 pending_actions = load_json(PENDING_FILE, {})
-group_ads = load_json(ADS_FILE, {})
 
 
 def persist_all():
     save_json(WHITELIST_FILE, whitelist_users)
     save_json(GROUPS_FILE, groups_data)
     save_json(PENDING_FILE, pending_actions)
-    save_json(ADS_FILE, group_ads)
+
+
+# =========================
+# PostgreSQL 广告数据库
+# =========================
+def get_db_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_ads_table():
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS group_ads (
+        id BIGSERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        content_type VARCHAR(20) NOT NULL DEFAULT 'text',
+        text_content TEXT NOT NULL DEFAULT '',
+        media_file_id TEXT NOT NULL DEFAULT '',
+        media_url TEXT NOT NULL DEFAULT '',
+        buttons_json TEXT NOT NULL DEFAULT '[]',
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def db_add_ad(chat_id: int, content_type: str, text_content: str = "", media_file_id: str = "", media_url: str = "", buttons=None):
+    if buttons is None:
+        buttons = []
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO group_ads (
+            chat_id, content_type, text_content, media_file_id, media_url, buttons_json, enabled
+        ) VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+    """, (
+        int(chat_id),
+        content_type,
+        text_content or "",
+        media_file_id or "",
+        media_url or "",
+        json.dumps(buttons, ensure_ascii=False)
+    ))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def db_get_ads(chat_id: int):
+    conn = get_db_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM group_ads
+        WHERE chat_id = %s
+        ORDER BY id ASC
+    """, (int(chat_id),))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def db_get_enabled_ads(chat_id: int):
+    conn = get_db_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM group_ads
+        WHERE chat_id = %s AND enabled = TRUE
+        ORDER BY id ASC
+    """, (int(chat_id),))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def db_get_ad(ad_id: int):
+    conn = get_db_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM group_ads
+        WHERE id = %s
+    """, (int(ad_id),))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+
+def db_delete_ad(ad_id: int):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM group_ads WHERE id = %s", (int(ad_id),))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def db_set_ad_enabled(ad_id: int, enabled: bool):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE group_ads
+        SET enabled = %s
+        WHERE id = %s
+    """, (enabled, int(ad_id)))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def db_ads_count(chat_id: int):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM group_ads WHERE chat_id = %s", (int(chat_id),))
+    count = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return count
 
 
 # =========================
@@ -207,8 +339,6 @@ def ensure_group_defaults(cfg: dict):
         cfg["title"] = ""
     if "bound_at" not in cfg:
         cfg["bound_at"] = now_str()
-
-    # 广告相关默认值
     if "ad_enabled" not in cfg:
         cfg["ad_enabled"] = False
     if "ad_interval_minutes" not in cfg:
@@ -219,7 +349,6 @@ def ensure_group_defaults(cfg: dict):
         cfg["ad_max_count"] = DEFAULT_AD_MAX_COUNT
     if "ad_rotate_index" not in cfg:
         cfg["ad_rotate_index"] = 0
-
     return cfg
 
 
@@ -242,56 +371,6 @@ def get_group_config(chat_id: int):
     else:
         groups_data[cid] = ensure_group_defaults(groups_data[cid])
     return groups_data[cid]
-
-
-def get_group_ads(chat_id: str):
-    ads = group_ads.get(str(chat_id), [])
-    if not isinstance(ads, list):
-        ads = []
-    return ads
-
-
-def save_group_ads(chat_id: str, ads_list: list):
-    group_ads[str(chat_id)] = ads_list
-    persist_all()
-
-
-def add_group_ad(chat_id: str, content: str):
-    ads = get_group_ads(chat_id)
-    ads.append({
-        "id": int(datetime.now().timestamp() * 1000),
-        "content": content,
-        "created_at": now_str(),
-        "enabled": True,
-    })
-    save_group_ads(chat_id, ads)
-
-
-def delete_group_ad(chat_id: str, ad_id: int):
-    ads = get_group_ads(chat_id)
-    ads = [a for a in ads if a.get("id") != ad_id]
-    save_group_ads(chat_id, ads)
-
-
-def get_next_ad_text(chat_id: str):
-    cfg = get_group_config(int(chat_id))
-    ads = [a for a in get_group_ads(chat_id) if a.get("enabled", True)]
-
-    if not ads:
-        return None
-
-    idx = int(cfg.get("ad_rotate_index", 0))
-    if idx >= len(ads):
-        idx = 0
-
-    ad = ads[idx]
-    cfg["ad_rotate_index"] = (idx + 1) % len(ads)
-    persist_all()
-    return ad.get("content", "").strip()
-
-
-def ads_count_text(chat_id: str):
-    return len(get_group_ads(chat_id))
 
 
 async def is_group_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -317,6 +396,91 @@ async def refresh_group_title(chat_id: str, context: ContextTypes.DEFAULT_TYPE):
         persist_all()
     except Exception:
         pass
+
+
+# =========================
+# 广告逻辑
+# =========================
+def get_next_ad(chat_id: str):
+    cfg = get_group_config(int(chat_id))
+    ads = db_get_enabled_ads(int(chat_id))
+
+    if not ads:
+        return None
+
+    idx = int(cfg.get("ad_rotate_index", 0))
+    if idx >= len(ads):
+        idx = 0
+
+    ad = ads[idx]
+    cfg["ad_rotate_index"] = (idx + 1) % len(ads)
+    persist_all()
+    return ad
+
+
+def build_ad_reply_markup(buttons_json: str):
+    try:
+        buttons = json.loads(buttons_json or "[]")
+    except Exception:
+        buttons = []
+
+    rows = []
+    row = []
+    for b in buttons:
+        text = (b.get("text") or "").strip()
+        url = (b.get("url") or "").strip()
+        if text and url:
+            row.append(InlineKeyboardButton(text, url=url))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+
+    if row:
+        rows.append(row)
+
+    if not rows:
+        return None
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_ad_by_format(chat_id: int, ad: dict, context: ContextTypes.DEFAULT_TYPE):
+    content_type = (ad.get("content_type") or "text").strip()
+    text_content = (ad.get("text_content") or "").strip()
+    media_file_id = (ad.get("media_file_id") or "").strip()
+    media_url = (ad.get("media_url") or "").strip()
+    media_ref = media_file_id or media_url
+    reply_markup = build_ad_reply_markup(ad.get("buttons_json", "[]"))
+
+    if content_type == "text":
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text_content or " ",
+            reply_markup=reply_markup
+        )
+        return
+
+    if content_type == "photo":
+        if not media_ref:
+            return
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=media_ref,
+            caption=text_content or "",
+            reply_markup=reply_markup
+        )
+        return
+
+    if content_type == "video":
+        if not media_ref:
+            return
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=media_ref,
+            caption=text_content or "",
+            reply_markup=reply_markup
+        )
+        return
 
 
 # =========================
@@ -383,35 +547,62 @@ async def maybe_send_expire_reminder(user_id: int, context: ContextTypes.DEFAULT
 # =========================
 def usage_tutorial_text():
     return (
-        "机器人使用教程\n\n"
-        "一、怎么开始使用\n"
-        "1. 先让管理员把你的账号加入白名单\n"
-        "2. 把机器人拉进你的群\n"
-        "3. 给机器人管理员权限\n"
-        "4. 机器人进群后，会自动绑定到你的后台\n\n"
-        "二、删除功能怎么设置\n"
+        "机器人使用教程（新版）\n\n"
+        "一、开始前先看这几条\n"
+        "1. 你必须先被管理员加入白名单\n"
+        "2. 机器人拉进群后，要给管理员权限\n"
+        "3. 只有绑定到你名下的群，你才能管理\n"
+        "4. 授权到期后，删除和广告功能都会停止\n\n"
+        "二、怎么开始使用\n"
         "1. 私聊机器人，点击“查看我的群”\n"
-        "2. 点进你要管理的群\n"
-        "3. 你可以开启/关闭删除\n"
-        "4. 可以设置 3秒、6秒、10秒\n"
-        "5. 也可以自己输入自定义秒数\n\n"
-        "三、广告功能怎么设置\n"
+        "2. 把机器人拉进你的群\n"
+        "3. 当机器人被授权用户拉进群后，会自动绑定到后台\n"
+        "4. 绑定成功后，你就能在后台看到这个群\n\n"
+        "三、删除功能怎么设置\n"
+        "1. 进入“查看我的群”\n"
+        "2. 点开你要管理的群\n"
+        "3. 可以选择：开启删除 / 关闭删除\n"
+        "4. 可以设置：3秒 / 6秒 / 10秒 / 自定义秒数\n"
+        "5. 普通成员消息会按你设置的秒数自动删除\n"
+        "6. 管理员和机器人消息不会删\n\n"
+        "四、广告功能怎么设置\n"
         "1. 进入某个群的管理页\n"
         "2. 点击“广告管理”\n"
         "3. 先设置广告数量上限\n"
-        "4. 再添加广告内容\n"
-        "5. 设置广告发送频率\n"
-        "6. 最后开启广告开关\n\n"
-        "四、广告是怎么发的\n"
-        "1. 每个群的广告单独保存\n"
-        "2. 每个群的频率单独设置\n"
-        "3. 每个群互不影响\n"
-        "4. 广告会按顺序轮流发送\n\n"
-        "五、注意事项\n"
-        "1. 机器人必须是群管理员\n"
-        "2. 你的授权过期后，群功能会失效\n"
-        "3. 如果群数量已满，需要联系管理员增加额度\n"
-        "4. 如果功能没生效，先检查机器人权限和白名单状态"
+        "4. 再设置广告频率（分钟）\n"
+        "5. 最后添加广告内容并开启广告\n\n"
+        "五、支持哪些广告格式\n"
+        "1. 文字广告\n"
+        "2. 图文广告（图片 + 文案）\n"
+        "3. 视频广告（视频 + 文案）\n\n"
+        "六、文字广告怎么发\n"
+        "1. 进入广告管理\n"
+        "2. 点击“添加文字广告”\n"
+        "3. 直接发送文字内容即可\n"
+        "4. 如果要加按钮，可以按这个格式发送：\n"
+        "正文内容\n"
+        "---buttons---\n"
+        "官网|https://example.com\n"
+        "联系我|https://t.me/你的用户名\n\n"
+        "七、图文广告怎么发\n"
+        "1. 点击“添加图文广告”\n"
+        "2. 私聊直接发送一张图片\n"
+        "3. 图片 caption 会作为广告文案\n\n"
+        "八、视频广告怎么发\n"
+        "1. 点击“添加视频广告”\n"
+        "2. 私聊直接发送一个视频\n"
+        "3. 视频 caption 会作为广告文案\n\n"
+        "九、广告是怎么运行的\n"
+        "1. 每个群都有自己的广告开关\n"
+        "2. 每个群都有自己的广告频率\n"
+        "3. 每个群都有自己的广告上限\n"
+        "4. 每个群广告独立轮播，互不影响\n"
+        "5. 你可以在广告列表里查看、启用、停用、删除单条广告\n\n"
+        "十、常见问题\n"
+        "1. 功能没生效：先检查机器人是不是群管理员\n"
+        "2. 后台看不到群：检查是不是你自己拉进去的、是否已授权\n"
+        "3. 广告不发：检查广告开关、频率、广告列表是否为空\n"
+        "4. 到期后功能失效：联系管理员续期"
     )
 
 
@@ -455,8 +646,8 @@ def user_panel():
 def build_groups_list(user_id: int):
     rows = []
     for cid, cfg in groups_data.items():
+        cfg = ensure_group_defaults(cfg)
         if cfg.get("owner_id") == user_id:
-            cfg = ensure_group_defaults(cfg)
             title = cfg.get("title") or f"群 {cid}"
             delay = cfg.get("delay", DEFAULT_DELETE_DELAY)
             status = "开启" if cfg.get("enabled", True) else "关闭"
@@ -507,26 +698,33 @@ def ad_manage_panel(chat_id: str):
         ],
         [InlineKeyboardButton("自定义广告频率", callback_data=f"ad_custom_freq|{chat_id}")],
         [InlineKeyboardButton("设置广告数量上限", callback_data=f"ad_set_max|{chat_id}")],
-        [InlineKeyboardButton("添加广告内容", callback_data=f"ad_add|{chat_id}")],
+        [
+            InlineKeyboardButton("添加文字广告", callback_data=f"ad_add_text|{chat_id}"),
+            InlineKeyboardButton("添加图文广告", callback_data=f"ad_add_photo|{chat_id}")
+        ],
+        [
+            InlineKeyboardButton("添加视频广告", callback_data=f"ad_add_video|{chat_id}")
+        ],
         [InlineKeyboardButton("查看广告列表", callback_data=f"ad_list|{chat_id}")],
         [InlineKeyboardButton("返回群管理", callback_data=f"group_open|{chat_id}")],
     ])
 
 
 def build_ads_list_panel(chat_id: str):
-    ads = get_group_ads(chat_id)
+    ads = db_get_ads(int(chat_id))
     rows = []
 
     if ads:
         for ad in ads:
-            preview = ad.get("content", "").replace("\n", " ")
-            if len(preview) > 18:
-                preview = preview[:18] + "..."
+            ad_type = ad.get("content_type", "text")
+            preview = (ad.get("text_content") or "").replace("\n", " ").strip()
+            if not preview:
+                preview = "无文案"
+            if len(preview) > 12:
+                preview = preview[:12] + "..."
+            label = f"{ad_type}｜#{ad['id']}｜{'开' if ad.get('enabled') else '关'}｜{preview}"
             rows.append([
-                InlineKeyboardButton(
-                    f"删除：{preview}",
-                    callback_data=f"ad_delete|{chat_id}|{ad.get('id')}"
-                )
+                InlineKeyboardButton(label, callback_data=f"ad_open|{chat_id}|{ad['id']}")
             ])
     else:
         rows = [[InlineKeyboardButton("当前没有广告", callback_data="noop")]]
@@ -535,17 +733,27 @@ def build_ads_list_panel(chat_id: str):
     return InlineKeyboardMarkup(rows)
 
 
+def ad_detail_panel(chat_id: str, ad_id: int, enabled: bool):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("启用", callback_data=f"ad_enable_one|{chat_id}|{ad_id}"),
+            InlineKeyboardButton("停用", callback_data=f"ad_disable_one|{chat_id}|{ad_id}")
+        ],
+        [InlineKeyboardButton("删除广告", callback_data=f"ad_delete|{chat_id}|{ad_id}")],
+        [InlineKeyboardButton("返回广告列表", callback_data=f"ad_list|{chat_id}")],
+    ])
+
+
 def group_info_text(chat_id: str):
     cfg = get_group_config(int(chat_id))
     title = cfg.get("title") or f"群 {chat_id}"
     enabled = "开启" if cfg.get("enabled", True) else "关闭"
     delay = cfg.get("delay", DEFAULT_DELETE_DELAY)
     bound_at = cfg.get("bound_at", "")
-
     ad_enabled = "开启" if cfg.get("ad_enabled", False) else "关闭"
     ad_interval = cfg.get("ad_interval_minutes", DEFAULT_AD_INTERVAL_MINUTES)
     ad_max = cfg.get("ad_max_count", DEFAULT_AD_MAX_COUNT)
-    ad_count = ads_count_text(chat_id)
+    ad_count = db_ads_count(int(chat_id))
 
     return (
         f"群名称：{title}\n"
@@ -568,8 +776,19 @@ def ad_info_text(chat_id: str):
         f"群ID：{chat_id}\n"
         f"广告状态：{'开启' if cfg.get('ad_enabled', False) else '关闭'}\n"
         f"广告频率：每 {cfg.get('ad_interval_minutes', DEFAULT_AD_INTERVAL_MINUTES)} 分钟\n"
-        f"广告数量：{ads_count_text(chat_id)}/{cfg.get('ad_max_count', DEFAULT_AD_MAX_COUNT)}\n"
+        f"广告数量：{db_ads_count(int(chat_id))}/{cfg.get('ad_max_count', DEFAULT_AD_MAX_COUNT)}\n"
         f"上次发送：{format_time(cfg.get('ad_last_sent_at', ''))}"
+    )
+
+
+def ad_detail_text(ad: dict):
+    return (
+        f"广告ID：{ad['id']}\n"
+        f"格式：{ad.get('content_type', 'text')}\n"
+        f"状态：{'启用' if ad.get('enabled') else '停用'}\n"
+        f"创建时间：{ad.get('created_at')}\n\n"
+        f"文案：\n{ad.get('text_content') or '无'}\n\n"
+        f"媒体：{ad.get('media_file_id') or ad.get('media_url') or '无'}"
     )
 
 
@@ -718,9 +937,6 @@ async def bind_group_if_allowed(update: Update):
     if not cfg.get("delay"):
         cfg["delay"] = DEFAULT_DELETE_DELAY
 
-    if str(chat.id) not in group_ads:
-        group_ads[str(chat.id)] = []
-
     persist_all()
 
 
@@ -827,8 +1043,7 @@ async def auto_send_ads(context: ContextTypes.DEFAULT_TYPE):
         if not cfg.get("ad_enabled", False):
             continue
 
-        ads = get_group_ads(cid)
-        if not ads:
+        if db_ads_count(int(cid)) == 0:
             continue
 
         interval_minutes = int(cfg.get("ad_interval_minutes", DEFAULT_AD_INTERVAL_MINUTES))
@@ -842,16 +1057,16 @@ async def auto_send_ads(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        ad_text = get_next_ad_text(cid)
-        if not ad_text:
+        ad = get_next_ad(cid)
+        if not ad:
             continue
 
         try:
-            await context.bot.send_message(chat_id=int(cid), text=ad_text)
+            await send_ad_by_format(int(cid), ad, context)
             cfg["ad_last_sent_at"] = now_str()
             persist_all()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"广告发送失败 chat_id={cid}: {e}")
 
 
 # =========================
@@ -1196,17 +1411,55 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data.startswith("ad_add|"):
+    if data.startswith("ad_add_text|"):
         _, chat_id = data.split("|", 1)
         cfg = groups_data.get(chat_id)
         if not cfg or cfg.get("owner_id") != user_id:
             await query.edit_message_text("无权管理这个群。")
             return
 
-        pending_actions[str(user_id)] = {"action": "add_group_ad", "chat_id": chat_id}
+        pending_actions[str(user_id)] = {"action": "add_text_ad", "chat_id": chat_id}
         persist_all()
         await query.edit_message_text(
-            "请直接发送广告内容。\n支持多行文本。",
+            "请直接发送文字广告内容。\n\n如果需要按钮，请按下面格式发送：\n"
+            "正文内容\n"
+            "---buttons---\n"
+            "官网|https://example.com\n"
+            "联系我|https://t.me/xxx",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]
+            ])
+        )
+        return
+
+    if data.startswith("ad_add_photo|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        pending_actions[str(user_id)] = {"action": "add_photo_ad", "chat_id": chat_id}
+        persist_all()
+        await query.edit_message_text(
+            "请发送一张图片。\n可以直接带 caption 作为文案。",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]
+            ])
+        )
+        return
+
+    if data.startswith("ad_add_video|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        pending_actions[str(user_id)] = {"action": "add_video_ad", "chat_id": chat_id}
+        persist_all()
+        await query.edit_message_text(
+            "请发送一个视频。\n可以直接带 caption 作为文案。",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]
             ])
@@ -1220,34 +1473,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("无权管理这个群。")
             return
 
-        ads = get_group_ads(chat_id)
-        if ads:
-            text = "当前广告列表：\n\n"
-            for i, ad in enumerate(ads, start=1):
-                text += f"{i}. {ad.get('content', '')[:30]}\n"
-        else:
-            text = "当前没有广告。"
-
-        await query.edit_message_text(text, reply_markup=build_ads_list_panel(chat_id))
+        await query.edit_message_text("当前广告列表：", reply_markup=build_ads_list_panel(chat_id))
         return
 
-    if data.startswith("ad_delete|"):
+    if data.startswith("ad_open|"):
         _, chat_id, ad_id = data.split("|")
         cfg = groups_data.get(chat_id)
         if not cfg or cfg.get("owner_id") != user_id:
             await query.edit_message_text("无权管理这个群。")
             return
 
-        delete_group_ad(chat_id, int(ad_id))
-        ads = get_group_ads(chat_id)
-        if ads:
-            text = "删除成功，当前广告列表：\n\n"
-            for i, ad in enumerate(ads, start=1):
-                text += f"{i}. {ad.get('content', '')[:30]}\n"
-        else:
-            text = "删除成功，当前没有广告。"
+        ad = db_get_ad(int(ad_id))
+        if not ad:
+            await query.edit_message_text("广告不存在。")
+            return
 
-        await query.edit_message_text(text, reply_markup=build_ads_list_panel(chat_id))
+        await query.edit_message_text(
+            ad_detail_text(ad),
+            reply_markup=ad_detail_panel(chat_id, int(ad_id), ad.get("enabled", True))
+        )
+        return
+
+    if data.startswith("ad_enable_one|"):
+        _, chat_id, ad_id = data.split("|")
+        db_set_ad_enabled(int(ad_id), True)
+        ad = db_get_ad(int(ad_id))
+        await query.edit_message_text(
+            ad_detail_text(ad),
+            reply_markup=ad_detail_panel(chat_id, int(ad_id), True)
+        )
+        return
+
+    if data.startswith("ad_disable_one|"):
+        _, chat_id, ad_id = data.split("|")
+        db_set_ad_enabled(int(ad_id), False)
+        ad = db_get_ad(int(ad_id))
+        await query.edit_message_text(
+            ad_detail_text(ad),
+            reply_markup=ad_detail_panel(chat_id, int(ad_id), False)
+        )
+        return
+
+    if data.startswith("ad_delete|"):
+        _, chat_id, ad_id = data.split("|")
+        db_delete_ad(int(ad_id))
+        await query.edit_message_text("广告已删除。", reply_markup=build_ads_list_panel(chat_id))
         return
 
 
@@ -1338,10 +1608,10 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("请输入 1 到 100 之间的整数。")
             return
 
-        current_ads = get_group_ads(chat_id)
-        if len(current_ads) > max_count:
+        current_count = db_ads_count(int(chat_id))
+        if current_count > max_count:
             await update.message.reply_text(
-                f"当前广告已有 {len(current_ads)} 条，不能直接改成 {max_count}。\n请先删除多余广告，再重新设置。"
+                f"当前广告已有 {current_count} 条，不能直接改成 {max_count}。\n请先删除多余广告，再重新设置。"
             )
             return
 
@@ -1354,7 +1624,7 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    if action == "add_group_ad":
+    if action == "add_text_ad":
         chat_id = action_info.get("chat_id")
         cfg = groups_data.get(chat_id)
         if not cfg or cfg.get("owner_id") != update.effective_user.id:
@@ -1363,20 +1633,38 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("无权操作该群。")
             return
 
-        current_ads = get_group_ads(chat_id)
+        current_count = db_ads_count(int(chat_id))
         max_count = int(cfg.get("ad_max_count", DEFAULT_AD_MAX_COUNT))
-
-        if len(current_ads) >= max_count:
-            await update.message.reply_text(
-                f"该群广告数量已达到上限 {max_count}。\n请先删除旧广告，或先提高广告数量上限。"
-            )
+        if current_count >= max_count:
+            await update.message.reply_text(f"该群广告数量已达到上限 {max_count}。")
             return
 
-        add_group_ad(chat_id, text)
+        main_text = text
+        buttons = []
+
+        if "---buttons---" in text:
+            parts = text.split("---buttons---", 1)
+            main_text = parts[0].strip()
+            btn_lines = parts[1].strip().splitlines()
+            for line in btn_lines:
+                if "|" in line:
+                    bt, url = line.split("|", 1)
+                    bt = bt.strip()
+                    url = url.strip()
+                    if bt and url:
+                        buttons.append({"text": bt, "url": url})
+
+        db_add_ad(
+            chat_id=int(chat_id),
+            content_type="text",
+            text_content=main_text,
+            buttons=buttons
+        )
+
         pending_actions.pop(user_id, None)
         persist_all()
         await update.message.reply_text(
-            "广告添加成功。\n\n" + ad_info_text(chat_id),
+            "文字广告添加成功。",
             reply_markup=ad_manage_panel(chat_id)
         )
         return
@@ -1455,7 +1743,69 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
 
+# =========================
+# 私聊媒体输入处理
+# =========================
+async def handle_private_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+
+    if update.effective_chat.type != "private":
+        return
+
+    user_id = str(update.effective_user.id)
+    if user_id not in pending_actions:
+        return
+
+    action_info = pending_actions[user_id]
+    action = action_info.get("action")
+    chat_id = action_info.get("chat_id")
+
+    cfg = groups_data.get(chat_id)
+    if not cfg or cfg.get("owner_id") != update.effective_user.id:
+        pending_actions.pop(user_id, None)
+        persist_all()
+        await update.message.reply_text("无权操作该群。")
+        return
+
+    current_count = db_ads_count(int(chat_id))
+    max_count = int(cfg.get("ad_max_count", DEFAULT_AD_MAX_COUNT))
+    if current_count >= max_count:
+        await update.message.reply_text(f"该群广告数量已达到上限 {max_count}。")
+        return
+
+    if action == "add_photo_ad" and update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        caption = update.message.caption or ""
+        db_add_ad(
+            chat_id=int(chat_id),
+            content_type="photo",
+            text_content=caption,
+            media_file_id=file_id
+        )
+        pending_actions.pop(user_id, None)
+        persist_all()
+        await update.message.reply_text("图文广告添加成功。", reply_markup=ad_manage_panel(chat_id))
+        return
+
+    if action == "add_video_ad" and update.message.video:
+        file_id = update.message.video.file_id
+        caption = update.message.caption or ""
+        db_add_ad(
+            chat_id=int(chat_id),
+            content_type="video",
+            text_content=caption,
+            media_file_id=file_id
+        )
+        pending_actions.pop(user_id, None)
+        persist_all()
+        await update.message.reply_text("视频广告添加成功。", reply_markup=ad_manage_panel(chat_id))
+        return
+
+
 def main():
+    init_ads_table()
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -1479,10 +1829,14 @@ def main():
         group=3
     )
 
-    # 自动广告任务：每30秒检查一次
+    app.add_handler(
+        MessageHandler(filters.PHOTO | filters.VIDEO, handle_private_media),
+        group=4
+    )
+
     app.job_queue.run_repeating(auto_send_ads, interval=30, first=20)
 
-    print("商业级删除机器人 V4（广告版）已启动...")
+    print("商业级删除机器人 V5（Postgres广告版）已启动...")
     app.run_polling()
 
 
