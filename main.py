@@ -8,7 +8,12 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
+from config import TOKEN, ADMIN_ID, ADMIN_USERNAME
+
+from db_storage import (
+    init_db,
+)    
+ApplicationBuilder,
     MessageHandler,
     CommandHandler,
     CallbackQueryHandler,
@@ -1884,8 +1889,11 @@ async def handle_private_media(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
 
+from db_storage import init_db  # 确保顶部已经导入
+
+
 def main():
-    init_ads_table()
+    init_db()  # ✅ 这个才是完整初始化（所有表）
 
     app = ApplicationBuilder().token(TOKEN).build()
 
