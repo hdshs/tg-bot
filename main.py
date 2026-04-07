@@ -17,7 +17,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 
 # ===== 这里改成你自己的信息 =====
 ADMIN_ID = 5593962796
-ADMIN_USERNAME = "vyfjii"
+ADMIN_USERNAME = "@vyfjii"
 # ===========================
 
 DATA_DIR = Path("data")
@@ -26,10 +26,14 @@ DATA_DIR.mkdir(exist_ok=True)
 WHITELIST_FILE = DATA_DIR / "whitelist_users.json"
 GROUPS_FILE = DATA_DIR / "groups.json"
 PENDING_FILE = DATA_DIR / "pending_actions.json"
+ADS_FILE = DATA_DIR / "group_ads.json"
 
 DEFAULT_DELETE_DELAY = 6
 DEFAULT_GROUP_LIMIT = 1
 DEFAULT_EXPIRE_DAYS = 30
+
+DEFAULT_AD_INTERVAL_MINUTES = 60
+DEFAULT_AD_MAX_COUNT = 3
 
 
 # =========================
@@ -71,12 +75,14 @@ def save_json(path: Path, data):
 whitelist_users = load_json(WHITELIST_FILE, {})
 groups_data = load_json(GROUPS_FILE, {})
 pending_actions = load_json(PENDING_FILE, {})
+group_ads = load_json(ADS_FILE, {})
 
 
 def persist_all():
     save_json(WHITELIST_FILE, whitelist_users)
     save_json(GROUPS_FILE, groups_data)
     save_json(PENDING_FILE, pending_actions)
+    save_json(ADS_FILE, group_ads)
 
 
 # =========================
@@ -190,6 +196,33 @@ def user_detail_text(user_id: int):
 # =========================
 # 群配置
 # =========================
+def ensure_group_defaults(cfg: dict):
+    if "owner_id" not in cfg:
+        cfg["owner_id"] = None
+    if "enabled" not in cfg:
+        cfg["enabled"] = True
+    if "delay" not in cfg:
+        cfg["delay"] = DEFAULT_DELETE_DELAY
+    if "title" not in cfg:
+        cfg["title"] = ""
+    if "bound_at" not in cfg:
+        cfg["bound_at"] = now_str()
+
+    # 广告相关默认值
+    if "ad_enabled" not in cfg:
+        cfg["ad_enabled"] = False
+    if "ad_interval_minutes" not in cfg:
+        cfg["ad_interval_minutes"] = DEFAULT_AD_INTERVAL_MINUTES
+    if "ad_last_sent_at" not in cfg:
+        cfg["ad_last_sent_at"] = ""
+    if "ad_max_count" not in cfg:
+        cfg["ad_max_count"] = DEFAULT_AD_MAX_COUNT
+    if "ad_rotate_index" not in cfg:
+        cfg["ad_rotate_index"] = 0
+
+    return cfg
+
+
 def get_group_config(chat_id: int):
     cid = str(chat_id)
     if cid not in groups_data:
@@ -199,9 +232,66 @@ def get_group_config(chat_id: int):
             "delay": DEFAULT_DELETE_DELAY,
             "title": "",
             "bound_at": now_str(),
+            "ad_enabled": False,
+            "ad_interval_minutes": DEFAULT_AD_INTERVAL_MINUTES,
+            "ad_last_sent_at": "",
+            "ad_max_count": DEFAULT_AD_MAX_COUNT,
+            "ad_rotate_index": 0,
         }
         persist_all()
+    else:
+        groups_data[cid] = ensure_group_defaults(groups_data[cid])
     return groups_data[cid]
+
+
+def get_group_ads(chat_id: str):
+    ads = group_ads.get(str(chat_id), [])
+    if not isinstance(ads, list):
+        ads = []
+    return ads
+
+
+def save_group_ads(chat_id: str, ads_list: list):
+    group_ads[str(chat_id)] = ads_list
+    persist_all()
+
+
+def add_group_ad(chat_id: str, content: str):
+    ads = get_group_ads(chat_id)
+    ads.append({
+        "id": int(datetime.now().timestamp() * 1000),
+        "content": content,
+        "created_at": now_str(),
+        "enabled": True,
+    })
+    save_group_ads(chat_id, ads)
+
+
+def delete_group_ad(chat_id: str, ad_id: int):
+    ads = get_group_ads(chat_id)
+    ads = [a for a in ads if a.get("id") != ad_id]
+    save_group_ads(chat_id, ads)
+
+
+def get_next_ad_text(chat_id: str):
+    cfg = get_group_config(int(chat_id))
+    ads = [a for a in get_group_ads(chat_id) if a.get("enabled", True)]
+
+    if not ads:
+        return None
+
+    idx = int(cfg.get("ad_rotate_index", 0))
+    if idx >= len(ads):
+        idx = 0
+
+    ad = ads[idx]
+    cfg["ad_rotate_index"] = (idx + 1) % len(ads)
+    persist_all()
+    return ad.get("content", "").strip()
+
+
+def ads_count_text(chat_id: str):
+    return len(get_group_ads(chat_id))
 
 
 async def is_group_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -289,6 +379,43 @@ async def maybe_send_expire_reminder(user_id: int, context: ContextTypes.DEFAULT
 
 
 # =========================
+# 教程文本
+# =========================
+def usage_tutorial_text():
+    return (
+        "机器人使用教程\n\n"
+        "一、怎么开始使用\n"
+        "1. 先让管理员把你的账号加入白名单\n"
+        "2. 把机器人拉进你的群\n"
+        "3. 给机器人管理员权限\n"
+        "4. 机器人进群后，会自动绑定到你的后台\n\n"
+        "二、删除功能怎么设置\n"
+        "1. 私聊机器人，点击“查看我的群”\n"
+        "2. 点进你要管理的群\n"
+        "3. 你可以开启/关闭删除\n"
+        "4. 可以设置 3秒、6秒、10秒\n"
+        "5. 也可以自己输入自定义秒数\n\n"
+        "三、广告功能怎么设置\n"
+        "1. 进入某个群的管理页\n"
+        "2. 点击“广告管理”\n"
+        "3. 先设置广告数量上限\n"
+        "4. 再添加广告内容\n"
+        "5. 设置广告发送频率\n"
+        "6. 最后开启广告开关\n\n"
+        "四、广告是怎么发的\n"
+        "1. 每个群的广告单独保存\n"
+        "2. 每个群的频率单独设置\n"
+        "3. 每个群互不影响\n"
+        "4. 广告会按顺序轮流发送\n\n"
+        "五、注意事项\n"
+        "1. 机器人必须是群管理员\n"
+        "2. 你的授权过期后，群功能会失效\n"
+        "3. 如果群数量已满，需要联系管理员增加额度\n"
+        "4. 如果功能没生效，先检查机器人权限和白名单状态"
+    )
+
+
+# =========================
 # 按钮UI
 # =========================
 def admin_contact_keyboard():
@@ -302,6 +429,7 @@ def super_admin_panel():
         [InlineKeyboardButton("白名单管理", callback_data="wl_menu")],
         [InlineKeyboardButton("用户查询", callback_data="query_user_help")],
         [InlineKeyboardButton("查看我的群", callback_data="my_groups")],
+        [InlineKeyboardButton("使用教程", callback_data="usage_tutorial")],
         [InlineKeyboardButton("联系管理员", url=f"https://t.me/{ADMIN_USERNAME}")]
     ])
 
@@ -319,6 +447,7 @@ def whitelist_menu_panel():
 def user_panel():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("查看我的群", callback_data="my_groups")],
+        [InlineKeyboardButton("使用教程", callback_data="usage_tutorial")],
         [InlineKeyboardButton("联系管理员", url=f"https://t.me/{ADMIN_USERNAME}")]
     ])
 
@@ -327,11 +456,16 @@ def build_groups_list(user_id: int):
     rows = []
     for cid, cfg in groups_data.items():
         if cfg.get("owner_id") == user_id:
+            cfg = ensure_group_defaults(cfg)
             title = cfg.get("title") or f"群 {cid}"
             delay = cfg.get("delay", DEFAULT_DELETE_DELAY)
             status = "开启" if cfg.get("enabled", True) else "关闭"
+            ad_status = "广告开" if cfg.get("ad_enabled", False) else "广告关"
             rows.append([
-                InlineKeyboardButton(f"{title}｜{status}｜{delay}秒", callback_data=f"group_open|{cid}")
+                InlineKeyboardButton(
+                    f"{title}｜删{status}｜{delay}秒｜{ad_status}",
+                    callback_data=f"group_open|{cid}"
+                )
             ])
 
     if not rows:
@@ -353,24 +487,89 @@ def group_manage_panel(chat_id: str):
             InlineKeyboardButton("10秒", callback_data=f"group_set|{chat_id}|10"),
         ],
         [InlineKeyboardButton("自定义秒数", callback_data=f"group_custom|{chat_id}")],
+        [InlineKeyboardButton("广告管理", callback_data=f"ad_menu|{chat_id}")],
         [InlineKeyboardButton("刷新群名", callback_data=f"group_refresh|{chat_id}")],
         [InlineKeyboardButton("返回群列表", callback_data="my_groups")],
         [InlineKeyboardButton("返回主菜单", callback_data="back_main")]
     ])
 
 
+def ad_manage_panel(chat_id: str):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("开启广告", callback_data=f"ad_enable|{chat_id}"),
+            InlineKeyboardButton("关闭广告", callback_data=f"ad_disable|{chat_id}")
+        ],
+        [
+            InlineKeyboardButton("30分钟", callback_data=f"ad_freq|{chat_id}|30"),
+            InlineKeyboardButton("60分钟", callback_data=f"ad_freq|{chat_id}|60"),
+            InlineKeyboardButton("180分钟", callback_data=f"ad_freq|{chat_id}|180"),
+        ],
+        [InlineKeyboardButton("自定义广告频率", callback_data=f"ad_custom_freq|{chat_id}")],
+        [InlineKeyboardButton("设置广告数量上限", callback_data=f"ad_set_max|{chat_id}")],
+        [InlineKeyboardButton("添加广告内容", callback_data=f"ad_add|{chat_id}")],
+        [InlineKeyboardButton("查看广告列表", callback_data=f"ad_list|{chat_id}")],
+        [InlineKeyboardButton("返回群管理", callback_data=f"group_open|{chat_id}")],
+    ])
+
+
+def build_ads_list_panel(chat_id: str):
+    ads = get_group_ads(chat_id)
+    rows = []
+
+    if ads:
+        for ad in ads:
+            preview = ad.get("content", "").replace("\n", " ")
+            if len(preview) > 18:
+                preview = preview[:18] + "..."
+            rows.append([
+                InlineKeyboardButton(
+                    f"删除：{preview}",
+                    callback_data=f"ad_delete|{chat_id}|{ad.get('id')}"
+                )
+            ])
+    else:
+        rows = [[InlineKeyboardButton("当前没有广告", callback_data="noop")]]
+
+    rows.append([InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 def group_info_text(chat_id: str):
-    cfg = groups_data.get(str(chat_id), {})
+    cfg = get_group_config(int(chat_id))
     title = cfg.get("title") or f"群 {chat_id}"
     enabled = "开启" if cfg.get("enabled", True) else "关闭"
     delay = cfg.get("delay", DEFAULT_DELETE_DELAY)
     bound_at = cfg.get("bound_at", "")
+
+    ad_enabled = "开启" if cfg.get("ad_enabled", False) else "关闭"
+    ad_interval = cfg.get("ad_interval_minutes", DEFAULT_AD_INTERVAL_MINUTES)
+    ad_max = cfg.get("ad_max_count", DEFAULT_AD_MAX_COUNT)
+    ad_count = ads_count_text(chat_id)
+
     return (
         f"群名称：{title}\n"
         f"群ID：{chat_id}\n"
-        f"状态：{enabled}\n"
+        f"删除状态：{enabled}\n"
         f"删除延迟：{delay} 秒\n"
-        f"绑定时间：{format_time(bound_at)}"
+        f"绑定时间：{format_time(bound_at)}\n\n"
+        f"广告状态：{ad_enabled}\n"
+        f"广告频率：每 {ad_interval} 分钟\n"
+        f"广告数量：{ad_count}/{ad_max}"
+    )
+
+
+def ad_info_text(chat_id: str):
+    cfg = get_group_config(int(chat_id))
+    title = cfg.get("title") or f"群 {chat_id}"
+    return (
+        f"广告管理\n\n"
+        f"群名称：{title}\n"
+        f"群ID：{chat_id}\n"
+        f"广告状态：{'开启' if cfg.get('ad_enabled', False) else '关闭'}\n"
+        f"广告频率：每 {cfg.get('ad_interval_minutes', DEFAULT_AD_INTERVAL_MINUTES)} 分钟\n"
+        f"广告数量：{ads_count_text(chat_id)}/{cfg.get('ad_max_count', DEFAULT_AD_MAX_COUNT)}\n"
+        f"上次发送：{format_time(cfg.get('ad_last_sent_at', ''))}"
     )
 
 
@@ -480,6 +679,7 @@ async def delwl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for _, cfg in groups_data.items():
         if cfg.get("owner_id") == uid:
             cfg["enabled"] = False
+            cfg["ad_enabled"] = False
 
     persist_all()
     await update.message.reply_text(f"已移出白名单：{uid}")
@@ -509,8 +709,18 @@ async def bind_group_if_allowed(update: Update):
     cfg["title"] = chat.title or ""
     cfg["enabled"] = True
     cfg["bound_at"] = now_str()
+    cfg["ad_enabled"] = cfg.get("ad_enabled", False)
+    cfg["ad_interval_minutes"] = cfg.get("ad_interval_minutes", DEFAULT_AD_INTERVAL_MINUTES)
+    cfg["ad_last_sent_at"] = cfg.get("ad_last_sent_at", "")
+    cfg["ad_max_count"] = cfg.get("ad_max_count", DEFAULT_AD_MAX_COUNT)
+    cfg["ad_rotate_index"] = cfg.get("ad_rotate_index", 0)
+
     if not cfg.get("delay"):
         cfg["delay"] = DEFAULT_DELETE_DELAY
+
+    if str(chat.id) not in group_ads:
+        group_ads[str(chat.id)] = []
+
     persist_all()
 
 
@@ -597,6 +807,54 @@ async def handle_group_messages(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # =========================
+# 自动广告调度
+# =========================
+async def auto_send_ads(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+
+    for cid, cfg in groups_data.items():
+        cfg = ensure_group_defaults(cfg)
+
+        owner_id = cfg.get("owner_id")
+        if not owner_id:
+            continue
+
+        if not is_whitelist_user(owner_id):
+            cfg["ad_enabled"] = False
+            persist_all()
+            continue
+
+        if not cfg.get("ad_enabled", False):
+            continue
+
+        ads = get_group_ads(cid)
+        if not ads:
+            continue
+
+        interval_minutes = int(cfg.get("ad_interval_minutes", DEFAULT_AD_INTERVAL_MINUTES))
+        last_sent_at = cfg.get("ad_last_sent_at", "")
+
+        if last_sent_at:
+            try:
+                last_dt = parse_time(last_sent_at)
+                if (now - last_dt).total_seconds() < interval_minutes * 60:
+                    continue
+            except Exception:
+                pass
+
+        ad_text = get_next_ad_text(cid)
+        if not ad_text:
+            continue
+
+        try:
+            await context.bot.send_message(chat_id=int(cid), text=ad_text)
+            cfg["ad_last_sent_at"] = now_str()
+            persist_all()
+        except Exception:
+            pass
+
+
+# =========================
 # 按钮
 # =========================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -619,6 +877,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("授权用户后台", reply_markup=user_panel())
             return
         await query.edit_message_text("未授权。", reply_markup=admin_contact_keyboard())
+        return
+
+    if data == "usage_tutorial":
+        if not (is_super_admin(user_id) or is_whitelist_user(user_id)):
+            await query.edit_message_text("未授权。", reply_markup=admin_contact_keyboard())
+            return
+        await query.edit_message_text(
+            usage_tutorial_text(),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回主菜单", callback_data="back_main")]
+            ])
+        )
         return
 
     if data == "wl_menu":
@@ -737,6 +1007,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for _, cfg in groups_data.items():
             if cfg.get("owner_id") == uid_int:
                 cfg["enabled"] = False
+                cfg["ad_enabled"] = False
         persist_all()
         await query.edit_message_text("已删除该白名单用户。", reply_markup=build_whitelist_list())
         return
@@ -844,6 +1115,141 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("群名已刷新。\n\n" + group_info_text(chat_id), reply_markup=group_manage_panel(chat_id))
         return
 
+    # ===== 广告管理 =====
+    if data.startswith("ad_menu|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        await query.edit_message_text(ad_info_text(chat_id), reply_markup=ad_manage_panel(chat_id))
+        return
+
+    if data.startswith("ad_enable|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        cfg["ad_enabled"] = True
+        persist_all()
+        await query.edit_message_text("已开启广告。\n\n" + ad_info_text(chat_id), reply_markup=ad_manage_panel(chat_id))
+        return
+
+    if data.startswith("ad_disable|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        cfg["ad_enabled"] = False
+        persist_all()
+        await query.edit_message_text("已关闭广告。\n\n" + ad_info_text(chat_id), reply_markup=ad_manage_panel(chat_id))
+        return
+
+    if data.startswith("ad_freq|"):
+        _, chat_id, minutes = data.split("|")
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        cfg["ad_interval_minutes"] = int(minutes)
+        persist_all()
+        await query.edit_message_text(f"已设置广告频率为每 {minutes} 分钟。\n\n" + ad_info_text(chat_id), reply_markup=ad_manage_panel(chat_id))
+        return
+
+    if data.startswith("ad_custom_freq|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        pending_actions[str(user_id)] = {"action": "set_custom_ad_freq", "chat_id": chat_id}
+        persist_all()
+        await query.edit_message_text(
+            "请直接发送广告频率，单位是分钟。\n例如：45",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]
+            ])
+        )
+        return
+
+    if data.startswith("ad_set_max|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        pending_actions[str(user_id)] = {"action": "set_ad_max", "chat_id": chat_id}
+        persist_all()
+        await query.edit_message_text(
+            "请直接发送广告数量上限。\n例如：5",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]
+            ])
+        )
+        return
+
+    if data.startswith("ad_add|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        pending_actions[str(user_id)] = {"action": "add_group_ad", "chat_id": chat_id}
+        persist_all()
+        await query.edit_message_text(
+            "请直接发送广告内容。\n支持多行文本。",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]
+            ])
+        )
+        return
+
+    if data.startswith("ad_list|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        ads = get_group_ads(chat_id)
+        if ads:
+            text = "当前广告列表：\n\n"
+            for i, ad in enumerate(ads, start=1):
+                text += f"{i}. {ad.get('content', '')[:30]}\n"
+        else:
+            text = "当前没有广告。"
+
+        await query.edit_message_text(text, reply_markup=build_ads_list_panel(chat_id))
+        return
+
+    if data.startswith("ad_delete|"):
+        _, chat_id, ad_id = data.split("|")
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+
+        delete_group_ad(chat_id, int(ad_id))
+        ads = get_group_ads(chat_id)
+        if ads:
+            text = "删除成功，当前广告列表：\n\n"
+            for i, ad in enumerate(ads, start=1):
+                text += f"{i}. {ad.get('content', '')[:30]}\n"
+        else:
+            text = "删除成功，当前没有广告。"
+
+        await query.edit_message_text(text, reply_markup=build_ads_list_panel(chat_id))
+        return
+
 
 # =========================
 # 私聊文字输入处理
@@ -886,6 +1292,92 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             f"已设置为 {sec} 秒删除。\n\n{group_info_text(chat_id)}",
             reply_markup=group_manage_panel(chat_id)
+        )
+        return
+
+    if action == "set_custom_ad_freq":
+        chat_id = action_info.get("chat_id")
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != update.effective_user.id:
+            pending_actions.pop(user_id, None)
+            persist_all()
+            await update.message.reply_text("无权操作该群。")
+            return
+
+        try:
+            minutes = int(text)
+            if minutes < 1 or minutes > 10080:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("请输入 1 到 10080 之间的整数分钟。")
+            return
+
+        cfg["ad_interval_minutes"] = minutes
+        pending_actions.pop(user_id, None)
+        persist_all()
+        await update.message.reply_text(
+            f"已设置广告频率为每 {minutes} 分钟。\n\n{ad_info_text(chat_id)}",
+            reply_markup=ad_manage_panel(chat_id)
+        )
+        return
+
+    if action == "set_ad_max":
+        chat_id = action_info.get("chat_id")
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != update.effective_user.id:
+            pending_actions.pop(user_id, None)
+            persist_all()
+            await update.message.reply_text("无权操作该群。")
+            return
+
+        try:
+            max_count = int(text)
+            if max_count < 1 or max_count > 100:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("请输入 1 到 100 之间的整数。")
+            return
+
+        current_ads = get_group_ads(chat_id)
+        if len(current_ads) > max_count:
+            await update.message.reply_text(
+                f"当前广告已有 {len(current_ads)} 条，不能直接改成 {max_count}。\n请先删除多余广告，再重新设置。"
+            )
+            return
+
+        cfg["ad_max_count"] = max_count
+        pending_actions.pop(user_id, None)
+        persist_all()
+        await update.message.reply_text(
+            f"已设置广告数量上限为 {max_count}。\n\n{ad_info_text(chat_id)}",
+            reply_markup=ad_manage_panel(chat_id)
+        )
+        return
+
+    if action == "add_group_ad":
+        chat_id = action_info.get("chat_id")
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != update.effective_user.id:
+            pending_actions.pop(user_id, None)
+            persist_all()
+            await update.message.reply_text("无权操作该群。")
+            return
+
+        current_ads = get_group_ads(chat_id)
+        max_count = int(cfg.get("ad_max_count", DEFAULT_AD_MAX_COUNT))
+
+        if len(current_ads) >= max_count:
+            await update.message.reply_text(
+                f"该群广告数量已达到上限 {max_count}。\n请先删除旧广告，或先提高广告数量上限。"
+            )
+            return
+
+        add_group_ad(chat_id, text)
+        pending_actions.pop(user_id, None)
+        persist_all()
+        await update.message.reply_text(
+            "广告添加成功。\n\n" + ad_info_text(chat_id),
+            reply_markup=ad_manage_panel(chat_id)
         )
         return
 
@@ -956,6 +1448,7 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         for _, cfg in groups_data.items():
             if cfg.get("owner_id") == target_uid:
                 cfg["enabled"] = False
+                cfg["ad_enabled"] = False
         pending_actions.pop(user_id, None)
         persist_all()
         await update.message.reply_text(f"已删除白名单用户：{target_uid}", reply_markup=whitelist_menu_panel())
@@ -986,7 +1479,10 @@ def main():
         group=3
     )
 
-    print("授权控制版 V3 已启动...")
+    # 自动广告任务：每30秒检查一次
+    app.job_queue.run_repeating(auto_send_ads, interval=30, first=20)
+
+    print("商业级删除机器人 V4（广告版）已启动...")
     app.run_polling()
 
 
