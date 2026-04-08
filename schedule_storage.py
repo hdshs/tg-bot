@@ -1,7 +1,6 @@
-import json
-from datetime import datetime, timedelta
 import psycopg2
 import psycopg2.extras
+from datetime import timedelta
 
 from config import DATABASE_URL
 
@@ -10,11 +9,8 @@ def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def parse_time(s: str):
+    from datetime import datetime
     return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
 
 
@@ -22,7 +18,6 @@ def init_schedule_tables():
     conn = get_conn()
     cur = conn.cursor()
 
-    # 固定时间广告表
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ad_fixed_times (
         id BIGSERIAL PRIMARY KEY,
@@ -38,14 +33,7 @@ def init_schedule_tables():
     conn.close()
 
 
-# =========================
-# 白名单到期时间增减
-# =========================
 def reduce_expire_in_memory(rec: dict, days: int):
-    """
-    先兼容你当前 main.py 的 JSON 结构。
-    rec 是 whitelist_users[uid] 那种字典
-    """
     expires_at = rec.get("expires_at", "")
     if not expires_at:
         return rec
@@ -60,14 +48,6 @@ def reduce_expire_in_memory(rec: dict, days: int):
     return rec
 
 
-def set_expire_in_memory(rec: dict, dt_str: str):
-    rec["expires_at"] = dt_str
-    return rec
-
-
-# =========================
-# 固定时间广告
-# =========================
 def add_fixed_time(chat_id: int, time_text: str):
     conn = get_conn()
     cur = conn.cursor()
