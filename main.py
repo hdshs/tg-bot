@@ -20,7 +20,15 @@ from telegram.ext import (
 
 from config import TOKEN, ADMIN_ID, ADMIN_USERNAME
 from db_storage import init_db
-
+from schedule_storage import (
+    init_schedule_tables,
+    reduce_expire_in_memory,
+    add_fixed_time,
+    get_fixed_times,
+    delete_fixed_time,
+    set_fixed_time_enabled,
+    mark_fixed_time_sent,
+)
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
@@ -1893,7 +1901,8 @@ from db_storage import init_db  # 确保顶部已经导入
 
 
 def main():
-    init_db()  # ✅ 这个才是完整初始化（所有表）
+    init_db()
+    init_schedule_tables()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
