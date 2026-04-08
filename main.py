@@ -1,4 +1,3 @@
-
 import os
 import json
 import asyncio
@@ -8,7 +7,6 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -18,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import TOKEN, ADMIN_ID, ADMIN_USERNAME
+from config import TOKEN, ADMIN_ID, ADMIN_USERNAME, DATABASE_URL
 from db_storage import init_db
 from schedule_storage import (
     init_schedule_tables,
@@ -29,13 +27,17 @@ from schedule_storage import (
     set_fixed_time_enabled,
     mark_fixed_time_sent,
 )
-TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-# ===== 这里改成你自己的信息 =====
-ADMIN_ID = 5593962796
-ADMIN_USERNAME = "vyfjii"
-# ===========================
+from panel_helpers import (
+    whitelist_user_buttons,
+    fixed_time_menu_panel,
+    fixed_time_item_panel,
+)
+from time_utils import (
+    is_valid_hhmm,
+    normalize_hhmm,
+    today_str,
+    now_hhmm,
+)
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -619,7 +621,9 @@ async def maybe_send_expire_reminder(user_id: int, context: ContextTypes.DEFAULT
             await context.bot.send_message(
                 chat_id=user_id,
                 text=text,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("联系管理员", url=f"https://t.me/{ADMIN_USERNAME}")]])
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("联系管理员", url=f"https://t.me/{ADMIN_USERNAME}")]
+                ])
             )
             rec["last_reminded_at"] = today_key
             persist_all()
@@ -632,7 +636,7 @@ async def maybe_send_expire_reminder(user_id: int, context: ContextTypes.DEFAULT
 # =========================
 def usage_tutorial_text():
     return (
-        "机器人使用教程（预览版广告模块）\n\n"
+        "机器人使用教程（固定时间广告版）\n\n"
         "一、开始前\n"
         "1. 先让管理员把你加入白名单\n"
         "2. 把机器人拉进群，并给管理员权限\n"
@@ -643,37 +647,35 @@ def usage_tutorial_text():
         "3. 可以开启/关闭删除\n"
         "4. 可以设置 3秒 / 6秒 / 10秒 / 自定义秒数\n"
         "5. 普通成员消息会按设定时间自动删除\n\n"
-        "三、广告功能新版怎么用\n"
+        "三、广告功能\n"
         "1. 进入某个群 → 广告管理\n"
         "2. 先设置广告数量上限\n"
-        "3. 再设置广告频率\n"
-        "4. 点击“新建广告”进入广告草稿界面\n"
-        "5. 通过按钮分别添加：文字、图片、视频、按钮链接\n"
-        "6. 配好后先点“预览广告”\n"
-        "7. 没问题再点“确认保存”\n\n"
-        "四、广告支持哪些形式\n"
+        "3. 可以设置间隔轮播频率\n"
+        "4. 也可以进入“固定时间发布”\n"
+        "5. 固定时间支持多个时间点，例如 09:00、18:30\n\n"
+        "四、广告草稿怎么做\n"
+        "1. 点击“新建广告”进入广告草稿界面\n"
+        "2. 通过按钮分别添加：文字、图片、视频、按钮链接\n"
+        "3. 配好后先点“预览广告”\n"
+        "4. 没问题再点“确认保存”\n\n"
+        "五、广告支持哪些形式\n"
         "1. 纯文字广告\n"
         "2. 图文广告（图片 + 文字 + 按钮）\n"
         "3. 视频广告（视频 + 文字 + 按钮）\n\n"
-        "五、广告草稿怎么编辑\n"
-        "1. 编辑文字：输入广告文案\n"
-        "2. 添加按钮：按“按钮文字|链接”的格式发送\n"
-        "3. 上传图片：发送图片即可\n"
-        "4. 上传视频：发送视频即可\n"
-        "5. 清空媒体：删除当前图片/视频\n"
-        "6. 清空按钮：删除当前所有按钮\n\n"
-        "六、重要说明\n"
-        "Telegram 单条消息不能同时带图片和视频。\n"
-        "所以一条广告只能是：文字，或 图片+文字，或 视频+文字。\n"
-        "如果你想同时发图片和视频，请做成两条广告轮播。\n\n"
-        "七、广告列表怎么管理\n"
-        "1. 在广告管理里点“广告列表”\n"
-        "2. 可以查看单条广告详情\n"
-        "3. 可以启用 / 停用 / 删除\n\n"
+        "六、固定时间发布怎么用\n"
+        "1. 进入广告管理 → 固定时间发布\n"
+        "2. 点击“添加固定时间”\n"
+        "3. 按 09:00 或 18:30 的格式发送\n"
+        "4. 一个群可以设置多个固定时间\n"
+        "5. 每个时间都可以启用 / 停用 / 删除\n\n"
+        "七、白名单时间管理\n"
+        "1. 超级管理员可以延长到期时间\n"
+        "2. 也可以减少到期时间\n"
+        "3. 如果减少后已经过期，该用户功能会按过期处理\n\n"
         "八、常见问题\n"
         "1. 群里没生效：检查机器人是不是群管理员\n"
         "2. 看不到群：检查是不是授权用户拉进群的\n"
-        "3. 广告不发：检查广告开关、频率、广告列表\n"
+        "3. 广告不发：检查广告开关、频率、广告列表或固定时间\n"
         "4. 功能突然停了：检查授权是否到期"
     )
 
@@ -682,7 +684,9 @@ def usage_tutorial_text():
 # UI
 # =========================
 def admin_contact_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("联系管理员", url=f"https://t.me/{ADMIN_USERNAME}")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("联系管理员", url=f"https://t.me/{ADMIN_USERNAME}")]
+    ])
 
 
 def super_admin_panel():
@@ -722,10 +726,12 @@ def build_groups_list(user_id: int):
             delay = cfg.get("delay", DEFAULT_DELETE_DELAY)
             status = "开启" if cfg.get("enabled", True) else "关闭"
             ad_status = "广告开" if cfg.get("ad_enabled", False) else "广告关"
-            rows.append([InlineKeyboardButton(
-                f"{title}｜删{status}｜{delay}秒｜{ad_status}",
-                callback_data=f"group_open|{cid}"
-            )])
+            rows.append([
+                InlineKeyboardButton(
+                    f"{title}｜删{status}｜{delay}秒｜{ad_status}",
+                    callback_data=f"group_open|{cid}"
+                )
+            ])
 
     if not rows:
         rows = [[InlineKeyboardButton("暂无已授权群", callback_data="noop")]]
@@ -765,6 +771,7 @@ def ad_manage_panel(chat_id: str):
             InlineKeyboardButton("180分钟", callback_data=f"ad_freq|{chat_id}|180"),
         ],
         [InlineKeyboardButton("自定义广告频率", callback_data=f"ad_custom_freq|{chat_id}")],
+        [InlineKeyboardButton("固定时间发布", callback_data=f"ad_fixed_menu|{chat_id}")],
         [InlineKeyboardButton("设置广告数量上限", callback_data=f"ad_set_max|{chat_id}")],
         [InlineKeyboardButton("新建广告", callback_data=f"ad_builder_start|{chat_id}")],
         [InlineKeyboardButton("广告列表", callback_data=f"ad_list|{chat_id}")],
@@ -785,7 +792,9 @@ def build_ads_list_panel(chat_id: str):
             if len(preview) > 12:
                 preview = preview[:12] + "..."
             label = f"{ad_type}｜#{ad['id']}｜{'开' if ad.get('enabled') else '关'}｜{preview}"
-            rows.append([InlineKeyboardButton(label, callback_data=f"ad_open|{chat_id}|{ad['id']}")])
+            rows.append([
+                InlineKeyboardButton(label, callback_data=f"ad_open|{chat_id}|{ad['id']}")
+            ])
     else:
         rows = [[InlineKeyboardButton("当前没有广告", callback_data="noop")]]
 
@@ -815,6 +824,7 @@ def group_info_text(chat_id: str):
     ad_interval = cfg.get("ad_interval_minutes", DEFAULT_AD_INTERVAL_MINUTES)
     ad_max = cfg.get("ad_max_count", DEFAULT_AD_MAX_COUNT)
     ad_count = db_ads_count(int(chat_id))
+    fixed_count = len(get_fixed_times(int(chat_id)))
 
     return (
         f"群名称：{title}\n"
@@ -824,6 +834,7 @@ def group_info_text(chat_id: str):
         f"绑定时间：{format_time(bound_at)}\n\n"
         f"广告状态：{ad_enabled}\n"
         f"广告频率：每 {ad_interval} 分钟\n"
+        f"固定时间：{fixed_count} 条\n"
         f"广告数量：{ad_count}/{ad_max}"
     )
 
@@ -831,12 +842,14 @@ def group_info_text(chat_id: str):
 def ad_info_text(chat_id: str):
     cfg = get_group_config(int(chat_id))
     title = cfg.get("title") or f"群 {chat_id}"
+    fixed_count = len(get_fixed_times(int(chat_id)))
     return (
         f"广告管理\n\n"
         f"群名称：{title}\n"
         f"群ID：{chat_id}\n"
         f"广告状态：{'开启' if cfg.get('ad_enabled', False) else '关闭'}\n"
         f"广告频率：每 {cfg.get('ad_interval_minutes', DEFAULT_AD_INTERVAL_MINUTES)} 分钟\n"
+        f"固定时间：{fixed_count} 条\n"
         f"广告数量：{db_ads_count(int(chat_id))}/{cfg.get('ad_max_count', DEFAULT_AD_MAX_COUNT)}\n"
         f"上次发送：{format_time(cfg.get('ad_last_sent_at', ''))}"
     )
@@ -851,26 +864,6 @@ def ad_detail_text(ad: dict):
         f"文案：\n{ad.get('text_content') or '无'}\n\n"
         f"媒体：{ad.get('media_file_id') or ad.get('media_url') or '无'}"
     )
-
-
-def whitelist_user_buttons(target_user_id: int):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("开启权限", callback_data=f"wl_enable|{target_user_id}"),
-            InlineKeyboardButton("关闭权限", callback_data=f"wl_disable|{target_user_id}")
-        ],
-        [
-            InlineKeyboardButton("延长7天", callback_data=f"wl_extend|{target_user_id}|7"),
-            InlineKeyboardButton("延长30天", callback_data=f"wl_extend|{target_user_id}|30")
-        ],
-        [
-            InlineKeyboardButton("群额度+1", callback_data=f"wl_limit_add|{target_user_id}"),
-            InlineKeyboardButton("群额度-1", callback_data=f"wl_limit_sub|{target_user_id}")
-        ],
-        [InlineKeyboardButton("删除白名单", callback_data=f"wl_delete|{target_user_id}")],
-        [InlineKeyboardButton("返回白名单列表", callback_data="wl_list")],
-        [InlineKeyboardButton("返回主菜单", callback_data="back_main")]
-    ])
 
 
 def build_whitelist_list():
@@ -1115,6 +1108,49 @@ async def auto_send_ads(context: ContextTypes.DEFAULT_TYPE):
             print(f"广告发送失败 chat_id={cid}: {e}")
 
 
+async def auto_send_fixed_time_ads(context: ContextTypes.DEFAULT_TYPE):
+    current_date = today_str()
+    current_hm = now_hhmm()
+
+    for cid, cfg in groups_data.items():
+        cfg = ensure_group_defaults(cfg)
+
+        owner_id = cfg.get("owner_id")
+        if not owner_id:
+            continue
+
+        if not is_whitelist_user(owner_id):
+            continue
+
+        if not cfg.get("ad_enabled", False):
+            continue
+
+        if db_ads_count(int(cid)) == 0:
+            continue
+
+        items = get_fixed_times(int(cid))
+        if not items:
+            continue
+
+        for item in items:
+            if not item["enabled"]:
+                continue
+            if item["time_text"] != current_hm:
+                continue
+            if item.get("last_sent_date") == current_date:
+                continue
+
+            ad = get_next_ad(cid)
+            if not ad:
+                continue
+
+            try:
+                await send_ad_by_format(int(cid), ad, context)
+                mark_fixed_time_sent(int(item["id"]), current_date)
+            except Exception as e:
+                print(f"固定时间广告发送失败 chat_id={cid}: {e}")
+
+
 # =========================
 # 按钮
 # =========================
@@ -1147,7 +1183,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text(
             usage_tutorial_text(),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回主菜单", callback_data="back_main")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回主菜单", callback_data="back_main")]
+            ])
         )
         return
 
@@ -1170,7 +1208,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, {"action": "query_user"})
         await query.edit_message_text(
             "请发送你要查询的用户ID",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回主菜单", callback_data="back_main")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回主菜单", callback_data="back_main")]
+            ])
         )
         return
 
@@ -1181,7 +1221,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("无权限。")
             return
 
-        await query.edit_message_text(user_detail_text(uid_int), reply_markup=whitelist_user_buttons(uid_int))
+        await query.edit_message_text(
+            user_detail_text(uid_int),
+            reply_markup=whitelist_user_buttons(uid_int)
+        )
         return
 
     if data.startswith("wl_enable|"):
@@ -1192,7 +1235,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         rec["enabled"] = True
         persist_all()
-        await query.edit_message_text(user_detail_text(int(uid)), reply_markup=whitelist_user_buttons(int(uid)))
+        await query.edit_message_text(
+            user_detail_text(int(uid)),
+            reply_markup=whitelist_user_buttons(int(uid))
+        )
         return
 
     if data.startswith("wl_disable|"):
@@ -1203,7 +1249,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         rec["enabled"] = False
         persist_all()
-        await query.edit_message_text(user_detail_text(int(uid)), reply_markup=whitelist_user_buttons(int(uid)))
+        await query.edit_message_text(
+            user_detail_text(int(uid)),
+            reply_markup=whitelist_user_buttons(int(uid))
+        )
         return
 
     if data.startswith("wl_extend|"):
@@ -1226,7 +1275,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rec["expires_at"] = (base + timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
         persist_all()
-        await query.edit_message_text(user_detail_text(int(uid)), reply_markup=whitelist_user_buttons(int(uid)))
+        await query.edit_message_text(
+            user_detail_text(int(uid)),
+            reply_markup=whitelist_user_buttons(int(uid))
+        )
+        return
+
+    if data.startswith("wl_reduce|"):
+        _, uid, days = data.split("|")
+        rec = get_user_record(int(uid))
+        if not rec:
+            await query.edit_message_text("用户不存在。")
+            return
+
+        reduce_expire_in_memory(rec, int(days))
+        persist_all()
+        await query.edit_message_text(
+            user_detail_text(int(uid)),
+            reply_markup=whitelist_user_buttons(int(uid))
+        )
         return
 
     if data.startswith("wl_limit_add|"):
@@ -1237,7 +1304,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         rec["max_groups"] = int(rec.get("max_groups", 0)) + 1
         persist_all()
-        await query.edit_message_text(user_detail_text(int(uid)), reply_markup=whitelist_user_buttons(int(uid)))
+        await query.edit_message_text(
+            user_detail_text(int(uid)),
+            reply_markup=whitelist_user_buttons(int(uid))
+        )
         return
 
     if data.startswith("wl_limit_sub|"):
@@ -1249,7 +1319,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current = int(rec.get("max_groups", 0))
         rec["max_groups"] = max(0, current - 1)
         persist_all()
-        await query.edit_message_text(user_detail_text(int(uid)), reply_markup=whitelist_user_buttons(int(uid)))
+        await query.edit_message_text(
+            user_detail_text(int(uid)),
+            reply_markup=whitelist_user_buttons(int(uid))
+        )
         return
 
     if data.startswith("wl_delete|"):
@@ -1271,7 +1344,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, {"action": "add_whitelist"})
         await query.edit_message_text(
             "请发送要添加的用户ID",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回白名单菜单", callback_data="wl_menu")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回白名单菜单", callback_data="wl_menu")]
+            ])
         )
         return
 
@@ -1279,7 +1354,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, {"action": "remove_whitelist"})
         await query.edit_message_text(
             "请发送要删除的用户ID",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回白名单菜单", callback_data="wl_menu")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回白名单菜单", callback_data="wl_menu")]
+            ])
         )
         return
 
@@ -1311,7 +1388,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cfg["enabled"] = True
         persist_all()
-        await query.edit_message_text("已开启删除。\n\n" + group_info_text(chat_id), reply_markup=group_manage_panel(chat_id))
+        await query.edit_message_text(
+            "已开启删除。\n\n" + group_info_text(chat_id),
+            reply_markup=group_manage_panel(chat_id)
+        )
         return
 
     if data.startswith("group_disable|"):
@@ -1323,7 +1403,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cfg["enabled"] = False
         persist_all()
-        await query.edit_message_text("已关闭删除。\n\n" + group_info_text(chat_id), reply_markup=group_manage_panel(chat_id))
+        await query.edit_message_text(
+            "已关闭删除。\n\n" + group_info_text(chat_id),
+            reply_markup=group_manage_panel(chat_id)
+        )
         return
 
     if data.startswith("group_set|"):
@@ -1335,7 +1418,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cfg["delay"] = int(sec)
         persist_all()
-        await query.edit_message_text(f"已设置为 {sec} 秒删除。\n\n" + group_info_text(chat_id), reply_markup=group_manage_panel(chat_id))
+        await query.edit_message_text(
+            f"已设置为 {sec} 秒删除。\n\n" + group_info_text(chat_id),
+            reply_markup=group_manage_panel(chat_id)
+        )
         return
 
     if data.startswith("group_custom|"):
@@ -1348,7 +1434,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, {"action": "set_custom_delay", "chat_id": chat_id})
         await query.edit_message_text(
             "请直接发送你要设置的秒数（例如：15）",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回群管理", callback_data=f"group_open|{chat_id}")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回群管理", callback_data=f"group_open|{chat_id}")]
+            ])
         )
         return
 
@@ -1360,7 +1448,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await refresh_group_title(chat_id, context)
-        await query.edit_message_text("群名已刷新。\n\n" + group_info_text(chat_id), reply_markup=group_manage_panel(chat_id))
+        await query.edit_message_text(
+            "群名已刷新。\n\n" + group_info_text(chat_id),
+            reply_markup=group_manage_panel(chat_id)
+        )
         return
 
     # ===== 广告管理 =====
@@ -1382,7 +1473,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cfg["ad_enabled"] = True
         persist_all()
-        await query.edit_message_text("已开启广告。\n\n" + ad_info_text(chat_id), reply_markup=ad_manage_panel(chat_id))
+        await query.edit_message_text(
+            "已开启广告。\n\n" + ad_info_text(chat_id),
+            reply_markup=ad_manage_panel(chat_id)
+        )
         return
 
     if data.startswith("ad_disable|"):
@@ -1393,7 +1487,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cfg["ad_enabled"] = False
         persist_all()
-        await query.edit_message_text("已关闭广告。\n\n" + ad_info_text(chat_id), reply_markup=ad_manage_panel(chat_id))
+        await query.edit_message_text(
+            "已关闭广告。\n\n" + ad_info_text(chat_id),
+            reply_markup=ad_manage_panel(chat_id)
+        )
         return
 
     if data.startswith("ad_freq|"):
@@ -1404,7 +1501,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cfg["ad_interval_minutes"] = int(minutes)
         persist_all()
-        await query.edit_message_text(f"已设置广告频率为每 {minutes} 分钟。\n\n" + ad_info_text(chat_id), reply_markup=ad_manage_panel(chat_id))
+        await query.edit_message_text(
+            f"已设置广告频率为每 {minutes} 分钟。\n\n" + ad_info_text(chat_id),
+            reply_markup=ad_manage_panel(chat_id)
+        )
         return
 
     if data.startswith("ad_custom_freq|"):
@@ -1416,7 +1516,83 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, {"action": "set_custom_ad_freq", "chat_id": chat_id})
         await query.edit_message_text(
             "请直接发送广告频率，单位是分钟。\n例如：45",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]
+            ])
+        )
+        return
+
+    if data.startswith("ad_fixed_menu|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+        clear_pending(user_id)
+        items = get_fixed_times(int(chat_id))
+        await query.edit_message_text(
+            "固定时间发布列表：",
+            reply_markup=fixed_time_menu_panel(chat_id, items)
+        )
+        return
+
+    if data.startswith("ad_fixed_add|"):
+        _, chat_id = data.split("|", 1)
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+        set_pending(user_id, {"action": "ad_fixed_add", "chat_id": chat_id})
+        await query.edit_message_text(
+            "请发送固定时间，格式：09:00 或 18:30",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回固定时间列表", callback_data=f"ad_fixed_menu|{chat_id}")]
+            ])
+        )
+        return
+
+    if data.startswith("ad_fixed_open|"):
+        _, chat_id, item_id = data.split("|")
+        cfg = groups_data.get(chat_id)
+        if not cfg or cfg.get("owner_id") != user_id:
+            await query.edit_message_text("无权管理这个群。")
+            return
+        items = get_fixed_times(int(chat_id))
+        target = next((x for x in items if int(x["id"]) == int(item_id)), None)
+        if not target:
+            await query.edit_message_text("时间项不存在。")
+            return
+        await query.edit_message_text(
+            f"固定时间：{target['time_text']}\n状态：{'启用' if target['enabled'] else '停用'}",
+            reply_markup=fixed_time_item_panel(chat_id, int(item_id))
+        )
+        return
+
+    if data.startswith("ad_fixed_enable|"):
+        _, chat_id, item_id = data.split("|")
+        set_fixed_time_enabled(int(item_id), True)
+        await query.edit_message_text(
+            "已启用该固定时间。",
+            reply_markup=fixed_time_item_panel(chat_id, int(item_id))
+        )
+        return
+
+    if data.startswith("ad_fixed_disable|"):
+        _, chat_id, item_id = data.split("|")
+        set_fixed_time_enabled(int(item_id), False)
+        await query.edit_message_text(
+            "已停用该固定时间。",
+            reply_markup=fixed_time_item_panel(chat_id, int(item_id))
+        )
+        return
+
+    if data.startswith("ad_fixed_delete|"):
+        _, chat_id, item_id = data.split("|")
+        delete_fixed_time(int(item_id))
+        items = get_fixed_times(int(chat_id))
+        await query.edit_message_text(
+            "已删除该固定时间。",
+            reply_markup=fixed_time_menu_panel(chat_id, items)
         )
         return
 
@@ -1429,7 +1605,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, {"action": "set_ad_max", "chat_id": chat_id})
         await query.edit_message_text(
             "请直接发送广告数量上限。\n例如：5",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告管理", callback_data=f"ad_menu|{chat_id}")]
+            ])
         )
         return
 
@@ -1451,7 +1629,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         set_pending(user_id, create_empty_ad_draft(chat_id))
         state = get_ad_draft(user_id)
-        await query.edit_message_text(ad_draft_summary(state["draft"]), reply_markup=ad_builder_panel(chat_id))
+        await query.edit_message_text(
+            ad_draft_summary(state["draft"]),
+            reply_markup=ad_builder_panel(chat_id)
+        )
         return
 
     if data.startswith("ad_builder_text|"):
@@ -1464,7 +1645,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, state)
         await query.edit_message_text(
             "请发送广告文字内容。",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回广告草稿", callback_data=f"ad_builder_back|{chat_id}")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告草稿", callback_data=f"ad_builder_back|{chat_id}")]
+            ])
         )
         return
 
@@ -1478,7 +1661,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, state)
         await query.edit_message_text(
             "请发送一个按钮，格式：\n按钮文字|https://example.com",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回广告草稿", callback_data=f"ad_builder_back|{chat_id}")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告草稿", callback_data=f"ad_builder_back|{chat_id}")]
+            ])
         )
         return
 
@@ -1492,7 +1677,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, state)
         await query.edit_message_text(
             "请发送一张图片。图片 caption 不会自动写入文字内容，文字请单独点“编辑文字”。",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回广告草稿", callback_data=f"ad_builder_back|{chat_id}")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告草稿", callback_data=f"ad_builder_back|{chat_id}")]
+            ])
         )
         return
 
@@ -1506,7 +1693,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_pending(user_id, state)
         await query.edit_message_text(
             "请发送一个视频。视频 caption 不会自动写入文字内容，文字请单独点“编辑文字”。",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回广告草稿", callback_data=f"ad_builder_back|{chat_id}")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回广告草稿", callback_data=f"ad_builder_back|{chat_id}")]
+            ])
         )
         return
 
@@ -1521,7 +1710,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["draft"]["media_file_id"] = ""
         state["draft"]["media_url"] = ""
         set_pending(user_id, state)
-        await query.edit_message_text(ad_draft_summary(state["draft"]), reply_markup=ad_builder_panel(chat_id))
+        await query.edit_message_text(
+            ad_draft_summary(state["draft"]),
+            reply_markup=ad_builder_panel(chat_id)
+        )
         return
 
     if data.startswith("ad_builder_clear_buttons|"):
@@ -1533,7 +1725,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["action"] = "ad_builder"
         state["draft"]["buttons"] = []
         set_pending(user_id, state)
-        await query.edit_message_text(ad_draft_summary(state["draft"]), reply_markup=ad_builder_panel(chat_id))
+        await query.edit_message_text(
+            ad_draft_summary(state["draft"]),
+            reply_markup=ad_builder_panel(chat_id)
+        )
         return
 
     if data.startswith("ad_builder_preview|"):
@@ -1605,7 +1800,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = get_ad_draft(user_id)
         state["action"] = "ad_builder"
         set_pending(user_id, state)
-        await query.edit_message_text(ad_draft_summary(state["draft"]), reply_markup=ad_builder_panel(chat_id))
+        await query.edit_message_text(
+            ad_draft_summary(state["draft"]),
+            reply_markup=ad_builder_panel(chat_id)
+        )
         return
 
     if data.startswith("ad_list|"):
@@ -1630,7 +1828,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("广告不存在。")
             return
 
-        await query.edit_message_text(ad_detail_text(ad), reply_markup=ad_detail_panel(chat_id, int(ad_id)))
+        await query.edit_message_text(
+            ad_detail_text(ad),
+            reply_markup=ad_detail_panel(chat_id, int(ad_id))
+        )
         return
 
     if data.startswith("ad_preview_saved|"):
@@ -1651,14 +1852,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, chat_id, ad_id = data.split("|")
         db_set_ad_enabled(int(ad_id), True)
         ad = db_get_ad(int(ad_id))
-        await query.edit_message_text(ad_detail_text(ad), reply_markup=ad_detail_panel(chat_id, int(ad_id)))
+        await query.edit_message_text(
+            ad_detail_text(ad),
+            reply_markup=ad_detail_panel(chat_id, int(ad_id))
+        )
         return
 
     if data.startswith("ad_disable_one|"):
         _, chat_id, ad_id = data.split("|")
         db_set_ad_enabled(int(ad_id), False)
         ad = db_get_ad(int(ad_id))
-        await query.edit_message_text(ad_detail_text(ad), reply_markup=ad_detail_panel(chat_id, int(ad_id)))
+        await query.edit_message_text(
+            ad_detail_text(ad),
+            reply_markup=ad_detail_panel(chat_id, int(ad_id))
+        )
         return
 
     if data.startswith("ad_delete|"):
@@ -1704,7 +1911,10 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         cfg["delay"] = sec
         persist_all()
         clear_pending(user_id)
-        await update.message.reply_text(f"已设置为 {sec} 秒删除。\n\n{group_info_text(chat_id)}", reply_markup=group_manage_panel(chat_id))
+        await update.message.reply_text(
+            f"已设置为 {sec} 秒删除。\n\n{group_info_text(chat_id)}",
+            reply_markup=group_manage_panel(chat_id)
+        )
         return
 
     if action == "set_custom_ad_freq":
@@ -1726,7 +1936,26 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         cfg["ad_interval_minutes"] = minutes
         persist_all()
         clear_pending(user_id)
-        await update.message.reply_text(f"已设置广告频率为每 {minutes} 分钟。\n\n{ad_info_text(chat_id)}", reply_markup=ad_manage_panel(chat_id))
+        await update.message.reply_text(
+            f"已设置广告频率为每 {minutes} 分钟。\n\n{ad_info_text(chat_id)}",
+            reply_markup=ad_manage_panel(chat_id)
+        )
+        return
+
+    if action == "ad_fixed_add":
+        chat_id = state.get("chat_id")
+
+        if not is_valid_hhmm(text):
+            await update.message.reply_text("格式错误，请按 09:00 或 18:30 发送。")
+            return
+
+        add_fixed_time(int(chat_id), normalize_hhmm(text))
+        clear_pending(user_id)
+        items = get_fixed_times(int(chat_id))
+        await update.message.reply_text(
+            "固定时间添加成功。",
+            reply_markup=fixed_time_menu_panel(chat_id, items)
+        )
         return
 
     if action == "set_ad_max":
@@ -1747,13 +1976,18 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         current_count = db_ads_count(int(chat_id))
         if current_count > max_count:
-            await update.message.reply_text(f"当前广告已有 {current_count} 条，不能直接改成 {max_count}。\n请先删除多余广告，再重新设置。")
+            await update.message.reply_text(
+                f"当前广告已有 {current_count} 条，不能直接改成 {max_count}。\n请先删除多余广告，再重新设置。"
+            )
             return
 
         cfg["ad_max_count"] = max_count
         persist_all()
         clear_pending(user_id)
-        await update.message.reply_text(f"已设置广告数量上限为 {max_count}。\n\n{ad_info_text(chat_id)}", reply_markup=ad_manage_panel(chat_id))
+        await update.message.reply_text(
+            f"已设置广告数量上限为 {max_count}。\n\n{ad_info_text(chat_id)}",
+            reply_markup=ad_manage_panel(chat_id)
+        )
         return
 
     if action == "ad_builder_text_input":
@@ -1804,7 +2038,10 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("未找到该用户。", reply_markup=whitelist_menu_panel())
             return
 
-        await update.message.reply_text(user_detail_text(target_uid), reply_markup=whitelist_user_buttons(target_uid))
+        await update.message.reply_text(
+            user_detail_text(target_uid),
+            reply_markup=whitelist_user_buttons(target_uid)
+        )
         return
 
     if action == "add_whitelist":
@@ -1821,7 +2058,10 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         create_whitelist_user(target_uid)
         clear_pending(user_id)
-        await update.message.reply_text(f"已添加白名单用户：{target_uid}", reply_markup=whitelist_menu_panel())
+        await update.message.reply_text(
+            f"已添加白名单用户：{target_uid}",
+            reply_markup=whitelist_menu_panel()
+        )
         return
 
     if action == "remove_whitelist":
@@ -1847,7 +2087,10 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
                 cfg["ad_enabled"] = False
         persist_all()
         clear_pending(user_id)
-        await update.message.reply_text(f"已删除白名单用户：{target_uid}", reply_markup=whitelist_menu_panel())
+        await update.message.reply_text(
+            f"已删除白名单用户：{target_uid}",
+            reply_markup=whitelist_menu_panel()
+        )
         return
 
 
@@ -1897,11 +2140,9 @@ async def handle_private_media(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
 
-from db_storage import init_db  # 确保顶部已经导入
-
-
 def main():
     init_db()
+    init_ads_table()
     init_schedule_tables()
 
     app = ApplicationBuilder().token(TOKEN).build()
@@ -1930,8 +2171,9 @@ def main():
     )
 
     app.job_queue.run_repeating(auto_send_ads, interval=30, first=20)
+    app.job_queue.run_repeating(auto_send_fixed_time_ads, interval=60, first=25)
 
-    print("商业级删除机器人 V6（结构优化 + 广告预览版）已启动...")
+    print("商业级删除机器人 V7（固定时间广告版）已启动...")
     app.run_polling()
 
 
